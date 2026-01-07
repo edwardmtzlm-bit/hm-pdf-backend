@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.status import HTTP_401_UNAUTHORIZED, HTTP_404_NOT_FOUND
 
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Integer, ForeignKey, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy.sql import func, select
 from passlib.context import CryptContext
@@ -22,6 +22,8 @@ import textwrap
 import os
 import uuid
 import copy
+import secrets
+import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -53,6 +55,7 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip()
+DELIVERY_TOKEN_TTL_MINUTES = int(os.getenv("DELIVERY_TOKEN_TTL_MINUTES", "10"))
 
 TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -83,6 +86,68 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+
+
+class Product(Base):
+    __tablename__ = "products"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    sku = Column(String, unique=True, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    product_type = Column(String, nullable=False)
+    size = Column(String, nullable=True)
+    isbn = Column(String, nullable=True)
+    stock_qty = Column(Integer, nullable=False, default=0)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Delivery(Base):
+    __tablename__ = "deliveries"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    status = Column(String, nullable=False, default="PENDIENTE")
+    recipient_name = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+    token = Column(String, nullable=True, unique=True, index=True)
+    token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_by = Column(String, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryItem(Base):
+    __tablename__ = "delivery_items"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    delivery_id = Column(String, ForeignKey("deliveries.id"), nullable=False, index=True)
+    product_id = Column(String, ForeignKey("products.id"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+
+
+class InventoryMovement(Base):
+    __tablename__ = "inventory_movements"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    product_id = Column(String, ForeignKey("products.id"), nullable=False, index=True)
+    quantity_delta = Column(Integer, nullable=False)
+    reason = Column(String, nullable=False)
+    delivery_id = Column(String, ForeignKey("deliveries.id"), nullable=True)
+    created_by = Column(String, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeliverySignature(Base):
+    __tablename__ = "delivery_signatures"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    delivery_id = Column(String, ForeignKey("deliveries.id"), nullable=False, index=True)
+    signed_by_name = Column(String, nullable=True)
+    image_base64 = Column(Text, nullable=False)
+    image_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -108,6 +173,78 @@ class UserOut(BaseModel):
     is_active: bool
 
 
+class ProductCreate(BaseModel):
+    sku: str
+    name: str
+    product_type: str
+    size: Optional[str] = None
+    isbn: Optional[str] = None
+    stock_qty: int = 0
+
+
+class ProductOut(BaseModel):
+    id: str
+    sku: str
+    name: str
+    product_type: str
+    size: Optional[str]
+    isbn: Optional[str]
+    stock_qty: int
+    is_active: bool
+
+
+class DeliveryItemCreate(BaseModel):
+    product_id: str
+    quantity: int
+
+
+class DeliveryCreate(BaseModel):
+    recipient_name: Optional[str] = None
+    notes: Optional[str] = None
+    items: List[DeliveryItemCreate]
+
+
+class DeliveryItemOut(BaseModel):
+    product_id: str
+    quantity: int
+    sku: str
+    name: str
+    size: Optional[str]
+
+
+class DeliveryOut(BaseModel):
+    id: str
+    status: str
+    recipient_name: Optional[str]
+    notes: Optional[str]
+    created_at: datetime
+    delivered_at: Optional[datetime]
+    items: List[DeliveryItemOut]
+
+
+class DeliveryListOut(BaseModel):
+    id: str
+    status: str
+    recipient_name: Optional[str]
+    created_at: datetime
+    delivered_at: Optional[datetime]
+
+
+class DeliveryTokenOut(BaseModel):
+    delivery_id: str
+    token: str
+    expires_at: datetime
+
+
+class ScanTokenRequest(BaseModel):
+    token: str
+
+
+class ConfirmDeliveryRequest(BaseModel):
+    token: str
+    signed_by_name: Optional[str] = None
+    signature_base64: str
+
 def user_to_out(user: User) -> UserOut:
     return UserOut(
         id=user.id,
@@ -115,6 +252,53 @@ def user_to_out(user: User) -> UserOut:
         email=user.email,
         role=user.role,
         is_active=user.is_active,
+    )
+
+
+
+
+def product_to_out(product: Product) -> ProductOut:
+    return ProductOut(
+        id=product.id,
+        sku=product.sku,
+        name=product.name,
+        product_type=product.product_type,
+        size=product.size,
+        isbn=product.isbn,
+        stock_qty=product.stock_qty,
+        is_active=product.is_active,
+    )
+
+
+def delivery_item_to_out(item: DeliveryItem, product: Product) -> DeliveryItemOut:
+    return DeliveryItemOut(
+        product_id=product.id,
+        quantity=item.quantity,
+        sku=product.sku,
+        name=product.name,
+        size=product.size,
+    )
+
+
+def delivery_to_out(delivery: Delivery, items: List[DeliveryItemOut]) -> DeliveryOut:
+    return DeliveryOut(
+        id=delivery.id,
+        status=delivery.status,
+        recipient_name=delivery.recipient_name,
+        notes=delivery.notes,
+        created_at=delivery.created_at,
+        delivered_at=delivery.delivered_at,
+        items=items,
+    )
+
+
+def delivery_to_list_out(delivery: Delivery) -> DeliveryListOut:
+    return DeliveryListOut(
+        id=delivery.id,
+        status=delivery.status,
+        recipient_name=delivery.recipient_name,
+        created_at=delivery.created_at,
+        delivered_at=delivery.delivered_at,
     )
 
 
@@ -170,6 +354,20 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Permiso denegado")
     return user
+
+
+def require_staff(user: User = Depends(get_current_user)) -> User:
+    if user.role not in {"admin", "vendedor"}:
+        raise HTTPException(status_code=403, detail="Permiso denegado")
+    return user
+
+
+def generate_delivery_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def delivery_token_expiry() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(minutes=DELIVERY_TOKEN_TTL_MINUTES)
 
 
 def ensure_admin_user() -> None:
@@ -261,6 +459,197 @@ def create_user(
     db.commit()
     db.refresh(user)
     return user_to_out(user)
+
+
+
+# =========================
+#   INVENTORY / DELIVERIES
+# =========================
+@app.get("/api/products", response_model=List[ProductOut])
+def list_products(db: Session = Depends(get_db), _: User = Depends(require_staff)):
+    products = db.execute(select(Product).where(Product.is_active == True)).scalars().all()
+    return [product_to_out(p) for p in products]
+
+
+@app.post("/api/products", response_model=ProductOut)
+def create_product(
+    payload: ProductCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    if payload.stock_qty < 0:
+        raise HTTPException(status_code=400, detail="Stock invalido")
+    existing = db.execute(select(Product).where(Product.sku == payload.sku)).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="SKU ya existe")
+    product = Product(
+        sku=payload.sku.strip(),
+        name=payload.name.strip(),
+        product_type=payload.product_type.strip().lower(),
+        size=payload.size.strip() if payload.size else None,
+        isbn=payload.isbn.strip() if payload.isbn else None,
+        stock_qty=payload.stock_qty,
+        is_active=True,
+    )
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+    return product_to_out(product)
+
+
+@app.get("/api/deliveries", response_model=List[DeliveryListOut])
+def list_deliveries(db: Session = Depends(get_db), _: User = Depends(require_staff)):
+    deliveries = db.execute(
+        select(Delivery).order_by(Delivery.created_at.desc()).limit(50)
+    ).scalars().all()
+    return [delivery_to_list_out(d) for d in deliveries]
+
+
+@app.post("/api/deliveries", response_model=DeliveryTokenOut)
+def create_delivery(
+    payload: DeliveryCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Items requeridos")
+    item_map = {item.product_id: item for item in payload.items}
+    products = db.execute(select(Product).where(Product.id.in_(item_map.keys()))).scalars().all()
+    if len(products) != len(item_map):
+        raise HTTPException(status_code=400, detail="Producto no encontrado")
+    for item in payload.items:
+        if item.quantity <= 0:
+            raise HTTPException(status_code=400, detail="Cantidad invalida")
+    token = generate_delivery_token()
+    expires_at = delivery_token_expiry()
+    delivery = Delivery(
+        status="PENDIENTE",
+        recipient_name=payload.recipient_name.strip() if payload.recipient_name else None,
+        notes=payload.notes.strip() if payload.notes else None,
+        token=token,
+        token_expires_at=expires_at,
+        created_by=current_user.id,
+    )
+    db.add(delivery)
+    db.flush()
+    for item in payload.items:
+        db.add(
+            DeliveryItem(
+                delivery_id=delivery.id,
+                product_id=item.product_id,
+                quantity=item.quantity,
+            )
+        )
+    db.commit()
+    return DeliveryTokenOut(delivery_id=delivery.id, token=token, expires_at=expires_at)
+
+
+@app.get("/api/deliveries/{delivery_id}", response_model=DeliveryOut)
+def get_delivery(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_staff),
+):
+    delivery = db.execute(select(Delivery).where(Delivery.id == delivery_id)).scalar_one_or_none()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    items = db.execute(select(DeliveryItem).where(DeliveryItem.delivery_id == delivery_id)).scalars().all()
+    products = db.execute(select(Product).where(Product.id.in_([i.product_id for i in items]))).scalars().all()
+    product_map = {p.id: p for p in products}
+    out_items = [delivery_item_to_out(i, product_map[i.product_id]) for i in items]
+    return delivery_to_out(delivery, out_items)
+
+
+@app.post("/api/deliveries/scan", response_model=DeliveryOut)
+def scan_delivery(
+    payload: ScanTokenRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_staff),
+):
+    delivery = db.execute(select(Delivery).where(Delivery.token == payload.token)).scalar_one_or_none()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Token invalido")
+    if delivery.status != "PENDIENTE":
+        raise HTTPException(status_code=400, detail="Entrega no disponible")
+    if delivery.token_expires_at and delivery.token_expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Token expirado")
+    items = db.execute(select(DeliveryItem).where(DeliveryItem.delivery_id == delivery.id)).scalars().all()
+    products = db.execute(select(Product).where(Product.id.in_([i.product_id for i in items]))).scalars().all()
+    product_map = {p.id: p for p in products}
+    out_items = [delivery_item_to_out(i, product_map[i.product_id]) for i in items]
+    return delivery_to_out(delivery, out_items)
+
+
+@app.post("/api/deliveries/{delivery_id}/token", response_model=DeliveryTokenOut)
+def regenerate_delivery_token(
+    delivery_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_staff),
+):
+    delivery = db.execute(select(Delivery).where(Delivery.id == delivery_id)).scalar_one_or_none()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Entrega no encontrada")
+    if delivery.status != "PENDIENTE":
+        raise HTTPException(status_code=400, detail="Entrega no disponible")
+    token = generate_delivery_token()
+    expires_at = delivery_token_expiry()
+    delivery.token = token
+    delivery.token_expires_at = expires_at
+    db.commit()
+    return DeliveryTokenOut(delivery_id=delivery.id, token=token, expires_at=expires_at)
+
+
+@app.post("/api/deliveries/{delivery_id}/confirm")
+def confirm_delivery(
+    delivery_id: str,
+    payload: ConfirmDeliveryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_staff),
+):
+    with db.begin():
+        delivery = db.execute(select(Delivery).where(Delivery.id == delivery_id)).scalar_one_or_none()
+        if not delivery or delivery.token != payload.token:
+            raise HTTPException(status_code=404, detail="Entrega no encontrada")
+        if delivery.status != "PENDIENTE":
+            raise HTTPException(status_code=400, detail="Entrega no disponible")
+        if delivery.token_expires_at and delivery.token_expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="Token expirado")
+        items = db.execute(select(DeliveryItem).where(DeliveryItem.delivery_id == delivery.id)).scalars().all()
+        products = db.execute(select(Product).where(Product.id.in_([i.product_id for i in items]))).scalars().all()
+        product_map = {p.id: p for p in products}
+        for item in items:
+            product = product_map.get(item.product_id)
+            if not product:
+                raise HTTPException(status_code=400, detail="Producto no encontrado")
+            if product.stock_qty < item.quantity:
+                raise HTTPException(status_code=400, detail=f"Stock insuficiente para {product.sku}")
+        for item in items:
+            product = product_map[item.product_id]
+            product.stock_qty -= item.quantity
+            db.add(
+                InventoryMovement(
+                    product_id=product.id,
+                    quantity_delta=-item.quantity,
+                    reason="delivery",
+                    delivery_id=delivery.id,
+                    created_by=current_user.id,
+                )
+            )
+        signature_hash = hashlib.sha256(payload.signature_base64.encode("utf-8")).hexdigest()
+        db.add(
+            DeliverySignature(
+                delivery_id=delivery.id,
+                signed_by_name=payload.signed_by_name,
+                image_base64=payload.signature_base64,
+                image_hash=signature_hash,
+            )
+        )
+        delivery.status = "ENTREGADA"
+        delivery.delivered_at = datetime.now(timezone.utc)
+        delivery.token = None
+        delivery.token_expires_at = None
+    return {"ok": True}
+
 
 
 def sanitize_name(name: str) -> str:
